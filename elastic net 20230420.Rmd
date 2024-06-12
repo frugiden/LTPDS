@@ -1,0 +1,455 @@
+---
+title: "Predicting EPDS score at postpartum month 6 using elastic net"
+author: "Richelle Björvang"
+date: "2023-04-20"
+output:
+  html_document:
+    toc: true
+    toc_depth: 5
+    toc_float: true
+    number_sections: true
+    df_print: paged
+editor_options:
+  chunk_output_type: console
+---
+
+Aim: To determine predictive factors for depression at six months postpartum among women who have high EPDS at six weeks postpartum 
+
+*** Outcome: EPDS score at six months (continuous and binary)    
+*** Changes:  
+- code change in elastic net to ensure using the best model (selected_fit)  
+- add debugging to check that MSE goes down as you loop through i  
+
+
+# Packages
+```{r error=F, message=F, warning=F}
+knitr::opts_chunk$set(echo = TRUE)
+library(knitr)
+library(kableExtra)
+library(reshape2)
+library(readxl)
+library(foreign)
+library(dplyr)
+library(tidyr)
+library(tidyverse)
+library(table1)
+library(mice)
+library(caret)
+library(glmnet)
+library(ggplot2)
+library(ggthemes)
+library(flux)
+library(finalfit)
+library(pROC)
+
+org::initialize_project(
+  home = c(
+    "/home/raw996/skalkidou-lab/2023-giden-ppm6-ppd"
+  ),
+  argos = c(
+    "/data/argos/",
+    "//argos.rudbeck.uu.se/MyGroups$/"
+  ),
+  folders_to_be_sourced = NULL
+)
+```
+
+# Function
+```{r}
+theme_Publication <- function(base_size=14) {
+      library(grid)
+      library(ggthemes)
+      (theme_foundation(base_size=base_size)
+       + theme(plot.title = element_text(face = "bold",
+                                         size = rel(1.2), hjust = 0.5),
+               text = element_text(),
+               panel.background = element_rect(colour = NA),
+               plot.background = element_rect(colour = NA),
+               panel.border = element_rect(colour = NA),
+               axis.title = element_text(face = "bold",size = rel(1)),
+               axis.title.y = element_text(angle=90,vjust =2),
+               axis.title.x = element_text(vjust = -0.2),
+               axis.text = element_text(), 
+               axis.line = element_line(colour="black"),
+               axis.ticks = element_line(),
+               panel.grid.major = element_line(colour="#f0f0f0"),
+               panel.grid.minor = element_blank(),
+               legend.key = element_rect(colour = NA),
+               legend.position = "bottom",
+               legend.direction = "horizontal",
+               legend.key.size= unit(0.2, "cm"),
+               legend.spacing = unit(0, "cm"),
+               legend.title = element_text(face="italic"),
+               plot.margin=unit(c(10,5,5,5),"mm"),
+               strip.background=element_rect(colour="#f0f0f0",fill="#f0f0f0"),
+               strip.text = element_text(face="bold")
+          ))
+      
+}
+
+scale_fill_Publication <- function(...){
+      library(scales)
+      discrete_scale("fill","Publication",manual_pal(values = c("#386cb0","#fdb462","#7fc97f","#ef3b2c","#662506","#a6cee3","#fb9a99","#984ea3","#ffff33")), ...)
+
+}
+
+scale_colour_Publication <- function(...){
+      library(scales)
+      discrete_scale("colour","Publication",manual_pal(values = c("#386cb0","#fdb462","#7fc97f","#ef3b2c","#662506","#a6cee3","#fb9a99","#984ea3","#ffff33")), ...)
+
+}
+
+pvalue2groups <- function(x, ...) {
+ x <- x[-c(length(x),length(x)-1)]   # Remove "overall" group and missing EPDS
+  # Construct vectors of data y, and groups (strata) g
+    y <- unlist(x)
+    g <- factor(rep(1:length(x), times=sapply(x, length)))
+    if (is.numeric(y)) {
+# Check for normality using shapiro test
+      if (shapiro.test(y)$p.value > 0.05) {   
+              # For numeric variables, perform a standard 2-sample t-test
+              p <- t.test(y ~ g)$p.value
+    } else {
+              # For numeric variables, perform a standard 2-sample wilcox test
+            p <- wilcox.test(y ~ g)$p.value
+          }}  else {
+        # For categorical variables, perform a chi-squared test of independence
+        p <- chisq.test(table(y, g))$p.value
+    }
+    # Format the p-value, using an HTML entity for the less-than sign.
+    # The initial empty string places the output on the line below the variable label.
+    c("", sub("<", "&lt;", format.pval(p, digits=3, eps=0.001)))
+}
+
+pMiss <- function(x){sum(is.na(x))/length(x)*100}
+```
+
+# Dataset
+
+## Load
+
+For women (n=24) who participated twice and both pregnancies are in this study, only the first pregnancy was included. Twins (n=1) also excluded.  
+
+```{r error=F, message=F, warning=F}
+BASIC <- foreign::read.spss(file.path(org::project$argos,"Bronze/KBH_Basic/Richelle Björvang/Datasets/Karin/SPSS alla pat 7nov22_BASIC data.sav"), to.data.frame = TRUE, use.value.labels = TRUE)
+BASIC <- as.data.frame(BASIC)
+
+BASIC_new <- foreign::read.spss(file.path(org::project$argos,"Bronze/KBH_Basic/Richelle Björvang/Datasets/Karin/SPSS alla pat 13jan2023_BASIC data.sav"), to.data.frame = TRUE, use.value.labels = TRUE)
+BASIC_new <- as.data.frame(BASIC_new)
+
+
+BASIC_merge <- merge(BASIC, BASIC_new %>% select(CustomDataR, Ångestsjd), by.x="CustomDataR", by.y="CustomDataR", all.x=T)
+dim(BASIC)
+dim(BASIC_new)
+dim(BASIC_merge)
+BASIC_merge <- BASIC_merge %>% mutate(EPDS_anx_preg = ifelse(if_all(c(v17_NK_EPDS_anx_D,v32_NK_EPDS_anx_D),is.na),NA,
+                           case_when(v17_NK_EPDS_anx_D=="EPDS_anx 6+" |  v32_NK_EPDS_anx_D=="EPDS_anx 6 and above" ~ "1", TRUE~"0")))
+BASIC_merge$Ångestsjd[BASIC_merge$Ångestsjd=="na"] <- NA
+BASIC_merge$Ångestsjd <- droplevels(BASIC_merge$Ångestsjd)
+BASIC_merge <- BASIC_merge %>% arrange(NK_person_id, CustomDataR)  %>% distinct(NK_person_id, .keep_all = T) %>% filter(NK_MatchSequence_Twins=="No twin")
+
+variables <- read_excel(file.path(org::project$argos,"Bronze/KBH_Basic/Richelle Björvang/Datasets/Karin/Variables prediction analysis.xlsx"), col_types = c("text"))
+BASIC2 <- BASIC_merge %>% select(c("CustomDataR",variables$`Variables prediction analysis`, "Treatment_C_AD", "ppm6_EPDS_D_9R"))
+rownames(BASIC2) <- BASIC2$CustomDataR
+str(BASIC2)
+BASIC2$KrishändSIFFROR <- as.factor(BASIC2$KrishändSIFFROR)
+BASIC2$BarnetavvikelseSIFFROR <- as.factor(BASIC2$BarnetavvikelseSIFFROR)
+BASIC2$EPDS_anx_preg <- as.factor(BASIC2$EPDS_anx_preg)
+BASIC2 <- BASIC2 %>% mutate(NK_Age_at_partus=as.factor(cut(BASIC2$NK_Age_at_partus, breaks=c(-Inf,30,35,Inf), labels=c("<=30", "31-35",">35"))), v32_somn=as.factor(ifelse(v32_somn=="Less than 6h", "<6h", ">=6h")), NK_parity_KG=as.factor(cut(BASIC2$NK_parity_KG, breaks=c(-Inf,0,Inf), labels=c("Nulliparous", "Primi/multiparous"))), NK_gravlangd=as.factor(cut(BASIC2$NK_gravlangd, breaks=c(-Inf,258,Inf), labels=c("Preterm", "Not PreTerm"))), ppv6_EPDS_9R=as.factor(cut(BASIC2$ppv6_EPDS_9R, breaks=c(-Inf,18,Inf), labels=c("Moderate", "Severe"))))
+BASIC2 <- BASIC2 %>% select(-AmningsprobSIFFROR, -Treatment_C_AD, -Måendeinklna) 
+colnames(BASIC2)
+
+```
+
+## Missing values
+
+* Removed (a) variables with >40% missing (n=4),(b) individuals with >40% missing (n=8), final total is 654 women
+
+```{r}
+pMiss <- function(x){sum(is.na(x))/length(x)*100}
+
+BASIC2 %>% select(-CustomDataR) %>%
+  ff_glimpse() %>%
+  kable(., caption="Variable overview") %>% kable_styling(bootstrap_options = c("striped", "bordered"), full_width = T) 
+
+BASIC2 %>% select(-CustomDataR) %>%
+  missing_plot()
+
+sum(apply(BASIC2,1,pMiss)>=40)
+sum(apply(BASIC2,2,pMiss)>=40)
+
+#remove variables with >40% missing
+as.data.frame(apply(BASIC2,2,pMiss)) %>% rename(percent_missing = "apply(BASIC2, 2, pMiss)") %>% arrange(percent_missing) %>% kable(., caption="Percentage missing for each variable") %>% kable_styling(bootstrap_options = c("striped", "bordered"), full_width = T) 
+
+BASIC2 <- BASIC2 %>% select(-rownames(as.data.frame(apply(BASIC2,2,pMiss)) %>% filter(apply(BASIC2,2,pMiss) >=40)))
+
+#remove individuals with more than 40% missing
+as.data.frame(apply(BASIC2,1,pMiss)) %>% rename(percent_missing = "apply(BASIC2, 1, pMiss)") %>% arrange(percent_missing) %>% kable(., caption="Percentage missing for each variable") %>% kable_styling(bootstrap_options = c("striped", "bordered"), full_width = T) 
+
+BASIC2 <- BASIC2 %>% filter(!CustomDataR %in% rownames(as.data.frame(apply(BASIC2,1,pMiss)) %>% filter(apply(BASIC2,1,pMiss) >=40)))
+```
+
+## Table 1
+
+```{r}
+table1(~.|ppm6_EPDS_D_9R, data=BASIC2 %>% select(-CustomDataR, -ppm6_EPDS_9R) %>% mutate(ppm6_EPDS_D_9R=ifelse(is.na(ppm6_EPDS_D_9R), "MISSING EPDS", ifelse(ppm6_EPDS_D_9R=="0-11", "0-11", "12-30"))), overall="Total",  extra.col=list('P-value'=pvalue2groups), extra.col.pos=3)
+```
+
+## Split
+
+Splitting before imputation so that the test data does not see the train data during imputation.  
+
+```{r}
+set.seed(314)
+ind <- sample(2, nrow(BASIC2), replace=T, prob=c(0.7,0.3))
+train <- BASIC2[ind==1,]
+test <- BASIC2[ind==2,]
+colnames(BASIC2)
+summary(train)
+summary(test)
+```
+
+# Continuous EPDS
+
+## Imputation
+
+* Used MICE (multivariate imputation by chained equations) to impute missing values
+
+### Train
+
+```{r}
+impute_train <- mice(train %>% select(-CustomDataR, -ppm6_EPDS_D_9R),m=5,maxit=50,seed=314)
+summary(impute_train)
+stripplot(impute_train)
+
+train_imp <- complete(impute_train,4)
+colnames(train_imp)
+table1(~., data=train[,-1], caption="Overview of original train dataset")
+table1(~., data=train_imp, caption="Overview of imputed train dataset")
+```
+
+### Test
+```{r}
+impute_test <- mice(test %>% select(-CustomDataR, -ppm6_EPDS_D_9R),m=5,maxit=50,seed=314)
+summary(impute_test)
+stripplot(impute_test)
+
+test_imp <- complete(impute_test,4)
+colnames(test_imp)
+table1(~., data=test[,-1], caption="Overview of original test dataset")
+table1(~., data=test_imp, caption="Overview of imputed test dataset")
+```
+
+## Matrix
+```{r}
+x_train <- model.matrix(ppm6_EPDS_9R~., train_imp)[,-1]
+y_train <- train_imp$ppm6_EPDS_9R
+
+x_test <- model.matrix(ppm6_EPDS_9R~., test_imp)[,-1]
+y_test <- test_imp$ppm6_EPDS_9R
+match(colnames(x_train), colnames(x_test))
+```
+
+## Elastic net
+```{r}
+set.seed(7878)
+nfolds = 10
+list.of.fits <- list()
+selected_fit <- list()
+selected_fit$mse <- 999999
+for (i in seq(0,1,0.01)){
+  fit.name <- paste0("alpha", i)
+  list.of.fits[[fit.name]] <- cv.glmnet(x_train, y_train, type.measure = "mse", alpha=i, family="gaussian",  foldid = 1 + (1:nrow(x_train) %% nfolds), seed=1)
+  # check MSE
+  mse <- assess.glmnet(list.of.fits[[fit.name]], newx = x_train, newy = y_train)$mse
+cat("mse: ",mse,"\n")
+  if(mse < selected_fit$mse){
+    # replace with the best fit
+    selected_fit$mse <- mse
+    selected_fit$glmnet <- list.of.fits[[fit.name]]
+    selected_fit$alpha <- i
+  }
+}
+
+# selected elastic net model
+print(selected_fit)
+coef(selected_fit$glmnet) %>% as.matrix(.) %>% as.data.frame(.) %>% filter(!s1==0) %>% rename(Coefficient=s1) %>% kable(., caption=paste0(paste0("Elastic net: alpha", selected_fit$alpha), paste0(", lambda1.se=", round(selected_fit$glmnet$lambda.1se, 3)))) %>% kable_styling(bootstrap_options = c("striped", "bordered"), full_width = T)
+assess.glmnet(selected_fit$glmnet, newx = x_train, newy = y_train)$mse
+
+# assess model in testing data
+assess.glmnet(selected_fit$glmnet, newx = x_test, newy = y_test)$mse
+predicts <- predict(selected_fit$glmnet, s=selected_fit$glmnet$lambda.1se, newx=x_test,family="gaussian",type.measure ="mse")
+
+plot(y_test~predicts)
+```
+
+## Validation
+
+### Performance metrics
+```{r}
+predicts <- predict(selected_fit$glmnet, s=selected_fit$glmnet$lambda.1se, newx=x_test,family="gaussian",type.measure ="mse")
+
+data_ROC <- data.frame()
+# define this outside the loop to make your code simpler
+# cut such that the categories are 0-11, 12-30
+y_test_binary <- cut(y_test,breaks=c(-Inf,12,Inf), right=F, labels=c(0,1))
+for(i in 8:14){
+  # do this once at the top of the loop to make your code simpler
+  predicts_binary <- cut(predicts,breaks=c(-Inf,i,Inf), right=F, labels=c(0,1))
+  
+  cat(paste0("\n\n\nConfusion matrix for decision >=", i, "\n"))
+  print(caret::confusionMatrix(predicts_binary, y_test_binary, positive="1"))
+  
+  x <- caret::sensitivity(predicts_binary, y_test_binary, positive=1, negative=0)
+  y <- caret::specificity(predicts_binary, y_test_binary, positive=1, negative=0)
+  a <- caret::posPredValue(predicts_binary, y_test_binary, positive=1, negative=0, prevalence=mean(y_test_binary=="1"))
+  b <- caret::negPredValue(predicts_binary, y_test_binary, positive=1, negative=0, prevalence=mean(y_test_binary=="1"))
+
+  temp <- data.frame(Decision=paste0(">=",i), Cutoff=i, Sensitivity=x, Specificity=y, PPV=a, NPV=b)
+  data_ROC <- rbind(data_ROC, temp)
+}
+
+data_ROC %>% kable(., caption="Performance metrics at different cutoffs") %>% kable_styling(bootstrap_options = c("striped", "bordered"), full_width = T)
+```
+
+### ROC curve
+```{r}
+auc_EN <- flux::auc(1-data_ROC$Specificity, data_ROC$Sensitivity)
+
+ggplot(data_ROC, aes(x=1-Specificity, y=Sensitivity)) + 
+  geom_point() + 
+  geom_line() +
+  labs(x="1-Specificity", y="Sensitivity", title="ROC for elastic net") +
+  geom_text(x=0.62, y=0.38,label=paste0("AUC=",round(auc_EN,2))) +
+  scale_colour_Publication()+ theme_Publication()
+```
+
+
+
+# Binary outcome
+
+## Imputation
+
+* Used MICE (multivariate imputation by chained equations) to impute missing values
+
+### Train
+
+```{r}
+impute_trainB <- mice(train %>% select(-CustomDataR, -ppm6_EPDS_9R),m=5,maxit=50,seed=314)
+summary(impute_trainB)
+stripplot(impute_trainB)
+
+train_impB <- complete(impute_trainB,5)
+colnames(train_impB)
+table1(~., data=train[,-1], caption="Overview of original train dataset")
+table1(~., data=train_impB, caption="Overview of imputed train dataset")
+```
+
+### Test
+```{r}
+impute_testB <- mice(test %>% select(-CustomDataR, -ppm6_EPDS_9R),m=5,maxit=50,seed=314)
+summary(impute_testB)
+stripplot(impute_testB)
+
+test_impB <- complete(impute_testB,5)
+colnames(test_impB)
+table1(~., data=test[,-1], caption="Overview of original test dataset")
+table1(~., data=test_impB, caption="Overview of imputed test dataset")
+```
+
+## Matrix
+```{r}
+x_trainB <- model.matrix(ppm6_EPDS_D_9R~., train_impB)[,-1]
+y_trainB <- train_impB$ppm6_EPDS_D_9R
+
+x_testB <- model.matrix(ppm6_EPDS_D_9R~., test_impB)[,-1]
+y_testB <- test_impB$ppm6_EPDS_D_9R
+match(colnames(x_trainB), colnames(x_testB))
+```
+
+## Elastic net
+```{r}
+set.seed(7878)
+nfolds = 10
+list.of.fitsB <- list()
+selected_fitB <- list()
+selected_fitB$mse <- 999999
+for (i in seq(0,1,0.01)){
+  fit.name <- paste0("alpha", i)
+  list.of.fitsB[[fit.name]] <- cv.glmnet(x_trainB, y_trainB, type.measure = "mse", alpha=i, family="binomial",  foldid = 1 + (1:nrow(x_trainB) %% nfolds), seed=1)
+  # check MSE
+  mse <- assess.glmnet(list.of.fitsB[[fit.name]], newx = x_trainB, newy = y_trainB)$mse
+  cat("mse: ",mse,"\n")
+  if(mse < selected_fitB$mse){
+    # replace with the best fit
+    selected_fitB$mse <- mse
+    selected_fitB$glmnet <- list.of.fitsB[[fit.name]]
+    selected_fitB$alpha <- i
+  }
+}
+
+# selected elastic net model
+print(selected_fitB)
+coef(selected_fitB$glmnet) %>% as.matrix(.) %>% as.data.frame(.) %>% filter(!s1==0) %>% rename(Coefficient=s1) %>% mutate(OR=round(exp(Coefficient),2)) %>% kable(., caption=paste0(paste0("Elastic net: alpha", selected_fitB$alpha), paste0(", lambda1.se=", round(selected_fitB$glmnet$lambda.1se, 3)))) %>% kable_styling(bootstrap_options = c("striped", "bordered"), full_width = T)
+assess.glmnet(selected_fitB$glmnet, newx = x_trainB, newy = y_trainB)$mse
+
+# assess model in testing data
+assess.glmnet(selected_fitB$glmnet, newx = x_testB, newy = y_testB)$mse
+predictsB <- predict(selected_fitB$glmnet, s=selected_fitB$glmnet$lambda.1se, newx=x_testB,family="binomial",type.measure ="mse")
+
+plot(predictsB~y_testB)
+```
+
+## Validation
+
+```{r}
+predictsB <- predict(selected_fitB$glmnet, s=selected_fitB$glmnet$lambda.1se, newx=x_testB,family="binomial",type.measure ="mse")
+
+par(pty="s")
+pROC::roc(y_testB, predictsB, plot=T, percent=T, legacy.axes=T, col="blue", lwd=4, print.auc=T, xlab="False Positive Rate", ylab="True Positive Rate", print.thres="best", print.thres.best.method="closest.topleft", direction="<", print.auc.y=35)
+
+```
+
+
+# FINAL MODEL 
+
+1004 +  
+200 (if ADHD) +  
+168 (if depressed at v17 based on EPDS) +  
+69 (if anxious during pregnancy based on EPDS) +  
+45 (if depressed at v32 based on EPDS) +    
+42 (if with pregnancy complications) +  
+41 (if with crisis happening) +  
+8 (if with history of depression) +   
+8 (if primi/multiparous) +  
+-36 (if slept more than 6 hours at v32)  
+-30 (if with university education)
+Total/100 = EPDS score at ppm6  
+  
+EPDS: AUC 0.73  
+Cut-off at 10 [i.e. 0-9, 10-30] (Sens 77%, Spec 49%, PPV 49%, NPV 78%)    
+Cut-off at 11 [i.e. 0-10, 11-30] (Sens 61%, Spec 77%, PPV 62%, NPV 76%)    
+Cut-off at 12 [i.e. 0-11, 12-30] (Sens 48%, Spec 92%, PPV 79%, NPV 74%)    
+
+
+```{r}
+coef(selected_fit$glmnet) %>% as.matrix(.) %>% as.data.frame(.) %>% filter(!s1==0) %>% rename(Coefficient=s1) %>% mutate(Coefficient_100x=round(Coefficient*100,0)) %>% kable(., caption=paste0(paste0("Elastic net: alpha", selected_fit$alpha), paste0(", lambda1.se=", round(selected_fit$glmnet$lambda.1se, 3)))) %>% kable_styling(bootstrap_options = c("striped", "bordered"), full_width = T)
+assess.glmnet(list.of.fits[[fit.name]], newx = x_train, newy = y_train)$mse
+
+auc_EN <- flux::auc(1-data_ROC$Specificity, data_ROC$Sensitivity)
+
+ggplot(data_ROC, aes(x=1-Specificity, y=Sensitivity)) + 
+  geom_point() + 
+  geom_line() +
+  labs(x="1-Specificity", y="Sensitivity", title="ROC for elastic net") +
+  geom_text(x=0.62, y=0.38,label=paste0("AUC=",round(auc_EN,2))) +
+  scale_colour_Publication()+ theme_Publication()
+```
+
+
+# Environment
+
+```{r}
+sessionInfo()
+```
+
